@@ -12,7 +12,7 @@ public class LlmConfig {
     @Value("${langchain4j.open-ai.chat-model.base-url:https://api.deepseek.com}")
     private String baseUrl;
 
-    @Value("${langchain4j.open-ai.chat-model.api-key:sk-your-api-key-here}")
+    @Value("${langchain4j.open-ai.chat-model.api-key:sk-546ff6c09e2b498e8b68482bfc217f95}")
     private String apiKey;
 
     @Value("${langchain4j.open-ai.chat-model.model-name:deepseek-chat}")
@@ -26,9 +26,13 @@ public class LlmConfig {
 
     @Bean
     public ChatLanguageModel chatLanguageModel() {
+        String effectiveApiKey = apiKey;
+        if (effectiveApiKey == null || effectiveApiKey.isEmpty() || "sk-your-api-key-here".equals(effectiveApiKey)) {
+            effectiveApiKey = "sk-546ff6c09e2b498e8b68482bfc217f95";
+        }
         return OpenAiChatModel.builder()
                 .baseUrl(baseUrl)
-                .apiKey(apiKey)
+                .apiKey(effectiveApiKey)
                 .modelName(modelName)
                 .temperature(temperature)
                 .maxTokens(maxTokens)

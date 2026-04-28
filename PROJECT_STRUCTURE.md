@@ -553,10 +553,11 @@ backend/
 │   │   ├── SessionController.java             # 会话管理控制器
 │   │   └── DocumentController.java            # 文档管理控制器
 │   ├── service/                                # 业务逻辑层
-│   │   ├── RagChatService.java                # RAG 问答核心服务 ⭐
+│   │   ├── RagChatService.java                # RAG 问答核心服务 ⭐ (混合检索)
+│   │   ├── KeywordSearchService.java           # 关键词搜索服务 ⭐ (新增)
 │   │   ├── SessionManager.java                # 会话内存管理
 │   │   ├── DocumentParseService.java          # 文档解析调度
-│   │   ├── DocumentSplitService.java          # 文档分段/切分
+│   │   ├── DocumentSplitService.java          # 文档分段/切分 (标题感知)
 │   │   ├── VectorizationService.java          # 向量化存储服务
 │   │   └── prompt/
 │   │       └── RagPromptTemplate.java         # RAG Prompt 模板
@@ -609,7 +610,7 @@ backend/
 | `langchain4j-spring-boot-starter`         | 0.35.0 | LangChain4j 与 Spring Boot 集成             |
 | `langchain4j-open-ai`                     | 0.35.0 | OpenAI 兼容客户端（连接 DeepSeek）                |
 | `langchain4j-ollama`                      | 0.35.0 | Ollama 客户端（本地 Embedding 模型）              |
-| `langchain4j`                             | 0.35.0 | LangChain4j 核心（InMemoryEmbeddingStore 等） |
+| `langchain4j`                             | 0.35.0 | LangChain4j 核心（PgVectorEmbeddingStore 等） |
 | `langchain4j-embeddings-all-minilm-l6-v2` | 0.35.0 | ONNX 本地嵌入模型（备用方案）                        |
 | `pdfbox`                                  | 2.0.30 | PDF 文件解析（Apache）                         |
 | `poi-ooxml`                               | 5.2.5  | Word (.docx) 文件解析（Apache POI）            |
@@ -665,14 +666,17 @@ rag:
 
   # ===== RAG 检索参数 =====
   retrieval:
-    top-k: 5                            # 检索返回的最相关段落数
-    min-score: 0.5                      # 相似度最低阈值
+    top-k: 8                            # 检索返回的最相关段落数（混合检索后去重）
+    min-score: 0.25                    # 相似度最低阈值（降低以提升召回率）
 
   # ===== 文档切分参数 =====
   splitting:
-    max-segment-size: 1000              # 每个段落最大字符数
-    overlap: 200                        # 段落间重叠字符数
-    chunk-overlap: 200                  # 切分重叠（备用字段）
+    max-segment-size: 500              # 每个段落最大字符数（缩小以提升检索精度）
+    overlap: 50                        # 段落间重叠字符数
+
+  # ===== 向量化批处理参数 =====
+  vectorization:
+    batch-size: 5                      # 批量向量化大小
 
 # ===== 日志配置 =====
 logging:
@@ -885,7 +889,7 @@ logging:
 
 - **请求参数**: 无
 - **返回值**: `ApiResponse<Void>` — `{ "code": 200, "message": "已清除所有文档数据" }`
-- **功能**: 清除 InMemoryEmbeddingStore 中所有向量 + 清空文档注册表
+- **功能**: 清除 PgVectorEmbeddingStore (PostgreSQL) 中所有向量 + 清空文档注册表
 
 ***
 
@@ -908,11 +912,12 @@ logging:
 #### `service/RagChatService.java` ⭐ 核心业务
 
 - **路径**: `service/RagChatService.java`
-- **职责**: **RAG 问答核心业务逻辑**——检索增强生成（Retrieval-Augmented Generation）
+- **职责**: **RAG 问答核心业务逻辑**——**混合检索增强生成**（关键词搜索 + 语义向量检索）
 - **注解**: `@Service` + `@RequiredArgsConstructor`
 - **注入依赖**:
   - `ChatLanguageModel chatLanguageModel` — LLM 大语言模型（DeepSeek）
-  - `RagRetriever ragRetriever` — RAG 检索器（向量相似度搜索）
+  - `RagRetriever ragRetriever` — RAG 检索器（向量相似度搜索 + 查询扩展）
+  - `KeywordSearchService keywordSearchService` — 关键词搜索服务（子串匹配，中文优化）
   - `SessionManager sessionManager` — 会话管理器
 
 ***
@@ -923,24 +928,37 @@ logging:
   - `question`: 用户问题
   - `sessionId`: 会话 ID
 - **返回值**: `ChatResponse`（包含 answer、citations、sessionId、hasRelevantContext）
-- **处理流程**（RAG 标准流程）:
+- **处理流程**（混合检索 RAG 流程）:
   ```
   用户问题(question)
       ↓
-  ① 向量检索 (ragRetriever.retrieve)
+  ① 并行检索 (双路检索)
+      ├─ A. ragRetriever.retrieve(question)     → 语义向量检索
+      │   └─ 查询扩展: "泰坦尼克号" → ["泰坦尼克号", "关于泰坦尼克号的知识", "什么是泰坦尼克号", ...]
+      │   └─ 多变体去重合并，返回 top-k 结果
+      │
+      └─ B. keywordSearchService.search(question) → 关键词精确匹配
+          └─ 中文子串滑动窗口(2-4字)，按长度加权评分
+          ↓
+  ② mergeResults() 合并结果 (关键词优先 + 去重)
       ↓  返回 List<TextSegment> (最相关的文档片段)
-  ② 构建上下文 (buildContext)
+  ③ 构建上下文 (buildContext)
       ↓  将检索结果格式化为 "[片段N] 来源: xxx\n内容...\n\n"
-  ③ 构建引用列表 (buildCitations)
+  ④ 构建引用列表 (buildCitations)
       ↓  从 TextSegment 提取 sourceFileName + content
-  ④ 构建 Prompt (buildFullPrompt)
+  ⑤ 构建 Prompt (buildFullPrompt)
       ↓  SYSTEM_PROMPT + 上下文 + 用户问题（使用 RagPromptTemplate）
-  ⑤ 调用 LLM (chatLanguageModel.chat)
+  ⑥ 调用 LLM (chatLanguageModel.chat)
       ↓  将完整 prompt 发送给 DeepSeek，获取回答
-  ⑥ 保存消息 (sessionManager.addMessage)
+  ⑦ 保存消息 (sessionManager.addMessage)
       ↓  分别记录 UserMessage 和 AiMessage 到会话记忆
-  ⑦ 返回 ChatResponse
+  ⑧ 返回 ChatResponse
   ```
+- **混合检索策略说明**:
+  - **关键词搜索优先**: 对于短查询或专有名词（如"泰坦尼克号"、"红楼梦"），关键词匹配更精准
+  - **语义搜索补充**: 对于长查询或语义相近的问题，向量检索能找到隐含关联的内容
+  - **去重合并**: 使用 LinkedHashSet 保证顺序且去重，避免重复结果
+- **日志输出**: 记录"语义=X, 关键词=Y, 合并后=Z"便于调优
 - **Prompt 结构**:
   ```
   [系统提示] 你是一个智能文档助手。请根据以下检索到的文档片段回答用户问题...
@@ -1014,37 +1032,56 @@ logging:
 #### `service/DocumentSplitService.java`
 
 - **路径**: `service/DocumentSplitService.java`
-- **职责**: 将解析后的 Document 列表进一步**切分为固定大小的文本段落**（用于向量化）
+- **职责**: 将解析后的 Document 列表**智能切分为文本段落**（标题感知 + 固定大小混合策略）
 - **注解**: `@Service`
 - **配置参数**（来自 application.yml）:
-  - `rag.splitting.max-segment-size`: 默认 **1000** 字符/段
-  - `rag.splitting.overlap`: 默认 **200** 字符重叠
+  - `rag.splitting.max-segment-size`: 默认 **500** 字符/段（缩小以提升检索精度）
+  - `rag.splitting.overlap`: 默认 **50** 字符重叠
 
 ##### 核心方法: `split(List<Document> documents, String fileName)`
 
 - **参数**: 解析后的 Document 列表 + 文件名
 - **返回值**: `List<TextSegment>`（带 metadata 的文本段落列表）
-- **切分策略**:
-  1. 若文本 ≤ 1000 字符 → 整体作为一个段落
-  2. 若文本 > 1000 字符 → 按 `splitByFixedSize()` 切分：
-     - 每 1000 字符切一刀
-     - 在 `overlap` 范围内寻找最佳断点（优先换行符 `.` `。` `！` `？` `；`）
-     - 段落间有 200 字符重叠，保证语义连续性
-  3. 每个 TextSegment 添加 metadata: `{ segment_index, source_file }`
+- **切分策略（标题感知优先）**:
+  1. **检测 Markdown 标题**: 使用正则 `^(#{1,4}\s+.+)$` 匹配 `### xxx` 格式的标题
+  2. **按标题切分**: 如果文档包含多个标题，按标题位置拆分章节
+     - 每个标题+其内容作为一个独立段落
+     - 保证每个知识条目完整保留（不会跨条目截断）
+  3. **固定大小兜底**: 对于无标题或超长段落，使用固定大小切分：
+     - 每 500 字符切一刀
+     - 在 overlap 范围内寻找最佳断点（优先换行符、句号、问号等）
+     - 段落间有 50 字符重叠，保证语义连续性
+  4. 每个 TextSegment 添加 metadata: `{ segment_index, source_file }`
+- **优势对比原方案**:
+  | 维度   | 原方案 (8000字/段)   | 新方案 (500字/段 + 标题感知) |
+  | ---- | --------------- | ------------------- |
+  | 精度   | 一个chunk混合20+条知识 | 每个知识条目独立成段          |
+  | 召回率  | 向量被稀释，短查询难命中    | 关键词精准匹配             |
+  | 适用场景 | 长文档通用           | 结构化知识库（如FAQ、百科）     |
 
 ***
 
 #### `service/VectorizationService.java`
 
 - **路径**: `service/VectorizationService.java`
-- **职责**: 文档**向量化与存储**管理，将文本段落转为向量并存入内存向量数据库
+- **职责**: 文档**向量化与存储**管理，将文本段落转为向量并存入 PostgreSQL + 建立关键词索引
 - **注解**: `@Service` + `@RequiredArgsConstructor`
 - **注入依赖**:
   - `EmbeddingModel embeddingModel` — 向量化模型
-  - `InMemoryEmbeddingStore<TextSegment> embeddingStore` — 内存向量存储
+  - `EmbeddingStore<TextSegment> embeddingStore` — **PostgreSQL + pgvector 持久化向量存储** (PgVectorEmbeddingStore)
   - `DocumentSplitService documentSplitService` — 文档切分服务
+  - `KeywordSearchService keywordSearchService` — 关键词索引服务（新增）
   - `ConcurrentHashMap<String, DocumentMetadata> documentRegistry` — 文档注册表
   - 内部维护 `documentEmbeddingIds: ConcurrentHashMap<String, List<String>>` — 文档 ID → 向量 ID 列表的映射
+
+##### 核心方法: `vectorize(parseResult)`
+
+- **处理流程（增强版）**:
+  1. 调用 `DocumentSplitService.split()` 切分文档为段落
+  2. 批量向量化（按 batch-size 分批，默认每批5个）
+  3. 存储向量到 PgVectorEmbeddingStore (PostgreSQL)
+  4. **新增**: 同步建立关键词索引到 KeywordSearchService
+  5. 注册文档元数据到 documentRegistry
 
 ***
 
@@ -1057,6 +1094,60 @@ logging:
 | `clearAll()`                 | 无                   | `void`                   | 清空向量存储 + 注册表 + ID 映射                              |
 | `deleteDocument(documentId)` | 文档 ID               | `boolean`                | 根据文档 ID 找到对应的向量 ID 列表 → 批量移除向量 → 移除注册信息           |
 | `getTotalSegments()`         | 无                   | `int`                    | 统计所有文档的总段落数                                       |
+
+***
+
+#### `service/KeywordSearchService.java` ⭐ 新增
+
+- **路径**: `service/KeywordSearchService.java`
+- **职责**: **关键词精确搜索服务**，基于内存索引的中文子串匹配，作为语义向量检索的有力补充
+- **注解**: `@Service` + `@Slf4j`
+- **设计动机**:
+  - Embedding 模型（如 nomic-embed-text）对中文语义理解能力有限
+  - 短查询（如"泰坦尼克号"、"红楼梦"）与长文档的向量距离天然较远
+  - 关键词匹配能精准命中专有名词、实体名称等
+
+##### 核心数据结构
+
+| 字段                | 类型                                       | 说明                     |
+| ----------------- | ---------------------------------------- | ---------------------- |
+| `segmentRegistry` | `ConcurrentHashMap<String, TextSegment>` | 段落ID → 文本段落的内存索引（线程安全） |
+
+##### 公开方法一览
+
+| 方法名                                | 参数                | 返回值                         | 功能说明                            |
+| ---------------------------------- | ----------------- | --------------------------- | ------------------------------- |
+| `indexSegment(segmentId, segment)` | 段落ID + 文本段落       | `void`                      | 将单个文本段落到内存索引                    |
+| `indexSegments(segments)`          | Map< ID, Segment> | `void`                      | 批量索引多个段落                        |
+| `removeByDocumentId(docId)`        | 文档 ID             | `void`                      | 根据文档ID移除相关索引（按 source\_file 匹配） |
+| `clearAll()`                       | 无                 | `void`                      | 清空全部索引                          |
+| `search(query, maxResults)`        | 查询文本 + 最大结果数      | `List<KeywordSearchResult>` | **核心方法**: 关键词搜索                 |
+| `getSegmentCount()`                | 无                 | `int`                       | 获取已索引的段落总数                      |
+
+##### 核心算法: `search(String query, int maxResults)`
+
+- **参数**: 用户查询 + 最大返回数量
+- **返回值**: `List<KeywordSearchResult>` (包含 segment + score)
+- **算法流程**:
+  1. **关键词提取** (`extractKeywords`):
+     - 按空格/标点分割查询为词组
+     - 生成滑动窗口子串: 2字、3字、4字（覆盖不同粒度）
+     - 示例: `"泰坦尼克号"` → `["泰坦尼克号", "泰坦尼", "尼克", "泰坦", "坦尼", "克号"]`
+  2. **全文扫描匹配**: 遍历所有索引段落，统计每个关键词出现次数
+  3. **评分计算** (`calculateKeywordScore`):
+     - 基础分 = 出现次数 × log(1+次数)
+     - 权重加成 = min(关键词长度/2, 3.0) — 长关键词权重更高
+     - 总分 = Σ(每个关键词的 加权分)
+  4. **排序截取**: 按分数降序排列，返回前 maxResults 条
+
+##### 使用场景
+
+| 场景     | 效果         | 示例                    |
+| ------ | ---------- | --------------------- |
+| 专有名词查询 | ✅ 精准命中     | "泰坦尼克号" → 找到第95条知识    |
+| 短关键词查询 | ✅ 高召回率     | "蜂蜜" → 找到第87条知识       |
+| 中文实体名称 | ✅ 子串匹配有效   | "红楼梦" → 找到第2条知识       |
+| 长句语义查询 | ⚠️ 需配合语义搜索 | "如何提高工作效率?" → 主要靠向量检索 |
 
 ***
 
@@ -1107,22 +1198,29 @@ logging:
 #### `config/RetrieverConfig.java`
 
 - **路径**: `config/RetrieverConfig.java`
-- **职责**: 配置 RAG 检索器 Bean —— 实现向量相似度搜索
+- **职责**: 配置 RAG 检索器 Bean —— 实现向量相似度搜索 + **查询扩展**
 - **注解**: `@Configuration`
 - **配置属性**:
-  - `rag.retrieval.top-k`: 默认 **5**（返回最相似的 top-k 个段落）
-  - `rag.retrieval.min-score`: 默认 **0.5**（最低相似度阈值）
+  - `rag.retrieval.top-k`: 默认 **8**（返回最相似的 top-k 个段落，混合检索后去重）
+  - `rag.retrieval.min-score`: 默认 **0.25**（降低阈值以提升召回率，原值0.5对中文过于严格）
 - **Bean**: `RagRetriever ragRetriever(embeddingModel, embeddingStore, topK, minScore)`
 
 ##### 内部类 `RagRetriever` 核心方法: `retrieve(String queryText)`
 
 - **参数**: 用户查询文本
 - **返回值**: `List<TextSegment>`（最相关的文本段落列表）
-- **算法**:
-  1. 将 queryText 通过 EmbeddingModel 转为查询向量
-  2. 构建 `EmbeddingSearchRequest`（maxResults=topK, minScore=minScore）
-  3. 调用 `embeddingStore.search(request)` 执行向量相似度搜索
-  4. 返回匹配结果中的 TextSegment 列表
+- **算法（查询扩展 + 多变体检索）**:
+  1. **构建查询变体** (`buildQueryVariants`):
+     - 原始查询: `"泰坦尼克号"`
+     - 短查询(≤10字)自动扩展:
+       - `"关于泰坦尼克号的知识"`
+       - `"什么是泰坦尼克号"`
+       - `"泰坦尼克号相关信息"`
+     - 长查询无问号时追加: `"xxx是什么"`
+  2. **多变体并行检索**: 对每个变体执行向量相似度搜索
+  3. **去重合并**: 按文本内容去重，保留最高分
+  4. **截取 Top-K**: 最终只返回 top-k 个结果
+  5. **日志输出**: 记录检索数量、最高分、最低分、前3条结果预览
 
 ***
 
@@ -1132,8 +1230,8 @@ logging:
 - **职责**: 配置向量存储和文档注册表的 Bean
 - **注解**: `@Configuration`
 - **Beans**:
-  - `InMemoryEmbeddingStore<TextSegment> embeddingStore()` — **内存向量数据库**（LangChain4j 内置，应用重启后数据丢失）
-  - `ConcurrentHashMap<String, DocumentMetadata> documentRegistry()` — 文档元数据注册表
+  - `EmbeddingStore<TextSegment> embeddingStore()` — **PostgreSQL + pgvector 持久化向量数据库** (PgVectorEmbeddingStore，应用重启后数据不丢失)
+  - `ConcurrentHashMap<String, DocumentMetadata> documentRegistry()` — 文档元数据注册表（内存，可后续迁移到数据库）
 
 ***
 
@@ -1341,25 +1439,32 @@ logging:
 #### `service/prompt/RagPromptTemplate.java`
 
 - **路径**: `service/prompt/RagPromptTemplate.java`
-- **职责**: RAG 问答的 **Prompt 模板**，定义系统提示词和用户消息格式
+- **职责**: RAG 问答的 **Prompt 模板**，定义系统提示词和用户消息格式（优化版：积极利用检索结果）
 - **设计模式**: 工具类（`private` 构造函数，`final` 类）
 
-##### 系统提示词 (SYSTEM\_PROMPT):
+##### 系统提示词 (SYSTEM\_PROMPT) — 优化后:
 
 ```
-你是一个智能文档助手。请根据以下检索到的文档片段回答用户问题。
+你是一个智能文档助手，专门回答与知识库文档相关的问题。
 
-要求：
-1. 仅基于提供的【参考文档内容】回答，不要编造文档中没有的信息
-2. 如果参考文档中没有相关信息，请明确告知"在提供的文档中未找到相关内容"
-3. 回答时引用来源文档名称和关键信息
-4. 使用中文回答，语言简洁专业
-5. 如果用户的问题与文档无关，礼貌地引导回文档内容范围
+回答规则：
+1. 优先基于【参考文档内容】回答，尽量引用文档中的原文信息
+2. 如果参考文档中包含与用户问题相关的内容（即使是部分相关），请提取并整理后回答
+3. 只有当参考文档确实完全不相关时，才告知"在提供的文档中未找到相关内容"
+4. 回答时标注来源文档名称
+5. 使用中文回答，语言简洁专业
+6. 不要拒绝回答有参考文档支持的问题，即使匹配度不是100%
 ```
+
+**优化要点**:
+
+- 从"严格拒绝"改为"积极利用": 原版本要求"仅基于提供内容"，新版本鼓励提取部分相关信息
+- 降低拒绝门槛: 只有"确实完全不相关"才告知未找到，而非稍有偏差就拒绝
 
 ##### 用户消息构建: `buildUserMessage(question, context)`
 
-- 有上下文时: 组合「参考文档内容」+「用户问题」+ 指令
+- 有上下文时: 组合「参考文档内容」+「用户问题」+ **积极利用指令**
+  - 新增提示: "请仔细阅读以上参考文档，找出与用户问题相关的内容并回答。如果文档中有任何相关信息，请提取并整理回答。"
 - 无上下文时: 附带「未检索到相关文档内容」提示
 
 ***
@@ -1446,11 +1551,11 @@ logging:
 │  │                      Services (业务逻辑)                      │     │
 │  │  ┌────────────────┐  ┌─────────────┐  ┌─────────────────┐  │     │
 │  │  │ RagChatService │  │SessionMgr   │  │DocParseService  │  │     │
-│  │  │ (RAG问答核心)   │  │(会话管理)    │  │(解析调度)       │  │     │
+│  │  │ (混合检索RAG)   │  │(会话管理)    │  │(解析调度)       │  │     │
 │  │  └───────┬────────┘  └─────────────┘  └────────┬────────┘  │     │
 │  │          │                                       │           │     │
 │  │  ┌───────▼──────────────────────────────────────▼────────┐  │     │
-│  │  │ VectorizationService (切分→向量化→存储)                  │  │     │
+│  │  │ VectorizationService (切分→向量化→存储+关键词索引)      │  │     │
 │  │  └───────────────────────┬───────────────────────────────┘  │     │
 │  └──────────────────────────┼──────────────────────────────────┘     │
 │                             │                                        │
@@ -1475,7 +1580,15 @@ logging:
 │  │  └─────────────────────┘  └─────────────────────────────┘  │     │
 │  │                                                             │     │
 │  │  ┌─────────────────────────────────────────────────────┐   │     │
-│  │  │  InMemoryEmbeddingStore (向量数据库, 内存存储)        │   │     │
+│  │  │  PostgreSQL + pgvector (持久化向量数据库)            │   │     │
+│  │  │  - 数据库: rag                                      │   │     │
+│  │  │  - 表: document_embeddings                          │   │     │
+│  │  └─────────────────────────────────────────────────────┘   │     │
+│  │                                                             │     │
+│  │  ┌─────────────────────────────────────────────────────┐   │     │
+│  │  │  KeywordSearchService (内存关键词索引)               │   │     │
+│  │  │  - 中文子串匹配 (2-4字滑动窗口)                     │   │     │
+│  │  │  - 按长度加权评分                                   │   │     │
 │  │  └─────────────────────────────────────────────────────┘   │     │
 │  └─────────────────────────────────────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────────────┘
@@ -1501,7 +1614,7 @@ logging:
 
 ## 六、数据流向图
 
-### 6.1 问答流程（核心链路）
+### 6.1 问答流程（核心链路 - 混合检索版）
 
 ```
 用户输入问题
@@ -1525,20 +1638,26 @@ ChatController.streamChat(@RequestBody ChatRequest)
     ▼ (新线程)
 RagChatService.chat(question, sessionId)
     │
-    ├─① ragRetriever.retrieve(question)
-    │       │
-    │       ▼
-    │   EmbeddingModel.embed(query) → 向量
-    │   InMemoryEmbeddingStore.search() → Top-K 相似段落
+    ├─① 双路并行检索:
+    │   ├─ A. ragRetriever.retrieve(question)     [语义向量检索]
+    │   │       │
+    │   │       ├─ 查询扩展: "泰坦尼克号" → ["泰坦尼克号", "关于...", "什么是...", ...]
+    │   │       └─ PgVectorEmbeddingStore.search() → Top-K 相似段落 (PostgreSQL)
+    │   │
+    │   └─ B. keywordSearchService.search(question)  [关键词精确匹配]
+    │           │
+    │           └─ 内存子串匹配(2-4字滑动窗口) → 按长度加权评分
     │
-    ├─② buildFullPrompt(context + question)
+    ├─② mergeResults() 合并去重 (关键词优先 + LinkedHashSet)
     │
-    ├─③ chatLanguageModel.chat(prompt)
+    ├─③ buildFullPrompt(context + question)
+    │
+    ├─④ chatLanguageModel.chat(prompt)
     │       │
     │       ▼
     │   DeepSeek API → AI 回答文本
     │
-    ├─④ sessionManager.addMessage() (保存历史)
+    ├─⑤ sessionManager.addMessage() (保存历史)
     │
     ▼
 返回 ChatResponse(answer, citations, sessionId)
@@ -1579,9 +1698,13 @@ DocumentController.uploadDocument(@RequestParam MultipartFile)
     │
     ├─② VectorizationService.vectorize(parseResult)
     │       │
-    │       ├─ DocumentSplitService.split() → 固定大小切分(1000字+重叠200)
-    │       ├─ EmbeddingModel.embedAll(segments) → 批量向量化
-    │       └─ InMemoryEmbeddingStore.add(embedding, segment) → 存储向量
+    │       ├─ DocumentSplitService.split() → 标题感知智能切分(500字/段)
+    │       │   ├─ 检测 ### 标题 → 按章节拆分（每个知识条目独立）
+    │       │   └─ 无标题时 → 固定大小切分(500字+重叠50)
+    │       │
+    │       ├─ EmbeddingModel.embedAll(segments) → 批量向量化(每批5个)
+    │       ├─ PgVectorEmbeddingStore.add(embedding, segment) → 存储向量到 PostgreSQL
+    │       └─ KeywordSearchService.indexSegment() → 建立内存关键词索引 ⭐新增
     │
     ▼
 返回 DocumentMetadata (documentId, fileName, segmentCount)
@@ -1596,31 +1719,66 @@ DocumentController.uploadDocument(@RequestParam MultipartFile)
 
 ### 我想修改...
 
-| 需求              | 修改文件                                                | 说明                           |
-| --------------- | --------------------------------------------------- | ---------------------------- |
-| 修改 UI 布局/样式     | `ChatView.vue`, `ChatPanel.vue`, `Sidebar.vue`      | Vue 组件 + SCSS                |
-| 修改消息渲染效果        | `MessageBubble.vue`                                 | Markdown 渲染/气泡样式             |
-| 修改 Prompt 提示词   | `RagPromptTemplate.java`                            | 系统/用户提示词模板                   |
-| 切换 LLM 模型       | `application.yml` → `langchain4j.open-ai.*`         | 或修改 `LlmConfig.java`         |
-| 切换 Embedding 模型 | `application.yml` → `rag.embedding.*`               | ollama/remote/local 三种模式     |
-| 调整 RAG 检索参数     | `application.yml` → `rag.retrieval.*`               | top-k / min-score            |
-| 调整文档切分大小        | `application.yml` → `rag.splitting.*`               | max-segment-size / overlap   |
-| 新增文件格式支持        | 新建 `XxxFileParser.java` implements `FileParser`     | + 在 `FileParserFactory` 自动发现 |
-| 修改 SSE 分块大小     | `ChatController.java` → `chunkSize = 20`            | 当前每 20 字符一个 chunk            |
-| 修改 API 错误处理     | `GlobalExceptionHandler.java`                       | 异常 → HTTP 状态码映射              |
-| 修改 CORS 策略      | `WebConfig.java`                                    | 允许的域名/方法/头                   |
-| 修改前端代理配置        | `vite.config.ts` → server.proxy                     | 目标地址/端口                      |
-| 修改会话消息上限        | `SessionManager.java` → MAX\_MESSAGES\_PER\_SESSION | 当前 20 条                      |
-| 添加新的 API 接口     | 新建 `XxxController.java`                             | + 对应 Service 方法              |
+| 需求              | 修改文件                                                    | 说明                                  |
+| --------------- | ------------------------------------------------------- | ----------------------------------- |
+| 修改 UI 布局/样式     | `ChatView.vue`, `ChatPanel.vue`, `Sidebar.vue`          | Vue 组件 + SCSS                       |
+| 修改消息渲染效果        | `MessageBubble.vue`                                     | Markdown 渲染/气泡样式                    |
+| 修改 Prompt 提示词   | `RagPromptTemplate.java`                                | 系统/用户提示词模板（积极利用版）                   |
+| 切换 LLM 模型       | `application.yml` → `langchain4j.open-ai.*`             | 或修改 `LlmConfig.java`                |
+| 切换 Embedding 模型 | `application.yml` → `rag.embedding.*`                   | ollama/remote/local 三种模式            |
+| 调整 RAG 检索参数     | `application.yml` → `rag.retrieval.*`                   | top-k(8) / min-score(0.25)          |
+| 调整文档切分大小        | `application.yml` → `rag.splitting.*`                   | max-segment-size(500) / overlap(50) |
+| **调整关键词搜索**     | **`KeywordSearchService.java`** ⭐新增                     | **中文子串匹配/滑动窗口/评分权重**                |
+| **调整查询扩展策略**    | **`RetrieverConfig.java`** → `buildQueryVariants()` ⭐新增 | **短查询自动扩展变体**                       |
+| 新增文件格式支持        | 新建 `XxxFileParser.java` implements `FileParser`         | + 在 `FileParserFactory` 自动发现        |
+| 修改 SSE 分块大小     | `ChatController.java` → `chunkSize = 20`                | 当前每 20 字符一个 chunk                   |
+| 修改 API 错误处理     | `GlobalExceptionHandler.java`                           | 异常 → HTTP 状态码映射                     |
+| 修改 CORS 策略      | `WebConfig.java`                                        | 允许的域名/方法/头                          |
+| 修改前端代理配置        | `vite.config.ts` → server.proxy                         | 目标地址/端口                             |
+| 修改会话消息上限        | `SessionManager.java` → MAX\_MESSAGES\_PER\_SESSION     | 当前 20 条                             |
+| 添加新的 API 接口     | 新建 `XxxController.java`                                 | + 对应 Service 方法                     |
+
+### 混合检索架构说明 ⭐
+
+| 组件                   | 作用                | 适用场景               |
+| -------------------- | ----------------- | ------------------ |
+| KeywordSearchService | 关键词精确匹配（子串+滑动窗口）  | 专有名词、短查询、中文实体      |
+| RagRetriever (语义)    | 向量相似度搜索（查询扩展+多变体） | 长句查询、语义相近问题、隐含关联内容 |
+| mergeResults()       | 合并去重（关键词优先）       | 双路结果融合，避免重复        |
+
+### 常见问题排查
+
+| 问题现象           | 可能原因                     | 排查方向                              |
+| -------------- | ------------------------ | --------------------------------- |
+| 关键词能找到但回答"未找到" | Prompt模板过于严格             | 检查 `RagPromptTemplate.java` 的拒绝条件 |
+| 长查询找不到相关内容     | min-score过高或top-k过小      | 降低 `min-score`(如0.2) 或增大 `top-k`  |
+| 中文专有名词检索不到     | Embedding模型对中文支持差        | 已通过关键词搜索解决，检查索引是否建立成功             |
+| 文档切分后知识条目被截断   | max-segment-size过大且无标题感知 | 减小到500并确保使用标题感知切分                 |
 
 ***
 
 ## 八、注意事项
 
-1. **向量存储为内存存储**（InMemoryEmbeddingStore），应用重启后所有已上传文档的向量数据会丢失，需重新上传
-2. **Ollama 需要提前安装并拉取 Embedding 模型**: `ollama pull mxbai-embed-large`
+1. **向量存储使用 PostgreSQL + pgvector 持久化存储** (PgVectorEmbeddingStore)，应用重启后所有已上传文档的向量数据**不会丢失**。需要提前安装 PostgreSQL 并启用 pgvector 扩展（推荐使用 Docker 一键启动：`docker-compose up -d`）
+2. **Ollama 需要提前安装并拉取 Embedding 模型**: `ollama pull nomic-embed-text`（当前使用的轻量中文友好模型，768维）
 3. **DeepSeek API Key** 需要在 `application.yml` 中配置或通过环境变量 `DEEPSEEK_API_KEY` 注入
-4. **SSE 超时时间**设置为 120 秒（`SseEmitter(120000L)`），复杂问题可能需要更长时间
-5. **前端 v-for key 策略**使用动态拼接（id + contentLength + loading），确保 Vue 能正确检测消息变更并触发重渲染
-6. **会话 ID** 为 16 位短 UUID（去掉连字符后截取），在前端显示时会截取前 8 位
+4. **PostgreSQL 密码配置**: 可通过环境变量 `PGVECTOR_PASSWORD` 覆盖默认密码（见 application.yml 中的 `rag.vector.pgvector.password` 配置）
+5. **向量维度说明**:
+   - nomic-embed-text (Ollama, 当前默认): **768 维**
+   - mxbai-embed-large (Ollama, 备选): **1024 维**
+   - all-MiniLM-L6-v2 (ONNX): 384 维
+   - text-embedding-ada-002 (OpenAI): 1536 维
+   - *应用会根据 EmbeddingModel 自动获取正确的维度*
+   - *切换模型时需设置* *`drop-table-first: true`* *以重建表（维度变化）*
+6. **SSE 超时时间**设置为 120 秒（`SseEmitter(120000L)`），复杂问题可能需要更长时间
+7. **前端 v-for key 策略**使用动态拼接（id + contentLength + loading），确保 Vue 能正确检测消息变更并触发重渲染
+8. **会话 ID** 为 16 位短 UUID（去掉连字符后截取），在前端显示时会截取前 8 位
+9. **混合检索架构** ⭐新增:
+   - 关键词搜索（KeywordSearchService）基于内存索引，**应用重启后需要重新上传文档以重建索引**
+   - 语义搜索（PgVectorEmbeddingStore）基于 PostgreSQL，**数据持久化不丢失**
+   - 两者互补：关键词精准匹配专有名词，语义搜索理解隐含关联
+10. **文档切分策略**已优化为标题感知模式：
+    - 自动识别 Markdown 标题（`### xxx`），按知识条目独立切分
+    - 每个段落最大500字符，保证检索精度
+    - 对于结构化知识库（FAQ、百科等）效果显著提升
 

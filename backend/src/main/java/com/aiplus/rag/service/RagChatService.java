@@ -14,7 +14,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 @Slf4j
 @Service
@@ -23,21 +25,29 @@ public class RagChatService {
 
     private final ChatLanguageModel chatLanguageModel;
     private final RagRetriever ragRetriever;
+    private final KeywordSearchService keywordSearchService;
     private final SessionManager sessionManager;
 
     public ChatResponse chat(String question, String sessionId) {
         log.info("收到问答请求: sessionId={}, question={}", sessionId, truncate(question, 50));
 
-        List<TextSegment> relevantSegments = ragRetriever.retrieve(question);
+        List<TextSegment> semanticResults = ragRetriever.retrieve(question);
+        List<KeywordSearchService.KeywordSearchResult> keywordResults =
+                keywordSearchService.search(question, 5);
 
-        boolean hasRelevantContext = !relevantSegments.isEmpty();
+        List<TextSegment> mergedResults = mergeResults(semanticResults, keywordResults);
+
+        boolean hasRelevantContext = !mergedResults.isEmpty();
 
         if (!hasRelevantContext) {
             log.warn("未检索到相关文档内容, question={}", truncate(question, 50));
+        } else {
+            log.info("混合检索结果: 语义={}, 关键词={}, 合并后={}",
+                    semanticResults.size(), keywordResults.size(), mergedResults.size());
         }
 
-        String context = buildContext(relevantSegments);
-        List<Citation> citations = buildCitations(relevantSegments);
+        String context = buildContext(mergedResults);
+        List<Citation> citations = buildCitations(mergedResults);
 
         String fullUserMessage = buildFullPrompt(question, context);
 
@@ -54,6 +64,29 @@ public class RagChatService {
                 .sessionId(sessionId)
                 .hasRelevantContext(hasRelevantContext)
                 .build();
+    }
+
+    private List<TextSegment> mergeResults(
+            List<TextSegment> semanticResults,
+            List<KeywordSearchService.KeywordSearchResult> keywordResults) {
+
+        Set<String> seen = new LinkedHashSet<>();
+        List<TextSegment> merged = new ArrayList<>();
+
+        for (KeywordSearchService.KeywordSearchResult kr : keywordResults) {
+            String text = kr.segment().text();
+            if (seen.add(text)) {
+                merged.add(kr.segment());
+            }
+        }
+
+        for (TextSegment sr : semanticResults) {
+            if (seen.add(sr.text())) {
+                merged.add(sr);
+            }
+        }
+
+        return merged;
     }
 
     private String buildFullPrompt(String question, String context) {

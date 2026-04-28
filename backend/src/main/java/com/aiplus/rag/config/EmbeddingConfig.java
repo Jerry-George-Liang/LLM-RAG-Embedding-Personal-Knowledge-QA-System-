@@ -9,12 +9,14 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+import java.time.Duration;
+
 @Configuration
 public class EmbeddingConfig {
 
     private static final Logger log = LoggerFactory.getLogger(EmbeddingConfig.class);
 
-    private static final String OLLAMA_MODEL = "mxbai-embed-large";
+    private static final String OLLAMA_MODEL = "nomic-embed-text";
 
     @Value("${rag.embedding.type:ollama}")
     private String embeddingType;
@@ -31,15 +33,19 @@ public class EmbeddingConfig {
     @Value("${rag.embedding.remote.model-name:text-embedding-ada-002}")
     private String remoteModelName;
 
+    @Value("${rag.embedding.timeout-seconds:120}")
+    private int timeoutSeconds;
+
     @Bean
     public EmbeddingModel embeddingModel() {
-        log.info("初始化 Embedding 模型, 类型: {}", embeddingType);
+        log.info("初始化 Embedding 模型, 类型: {}, 超时: {}s", embeddingType, timeoutSeconds);
 
         if ("ollama".equalsIgnoreCase(embeddingType)) {
             log.info("使用 Ollama Embedding 模型: {} @ {}", OLLAMA_MODEL, ollamaBaseUrl);
             return OllamaEmbeddingModel.builder()
                     .baseUrl(ollamaBaseUrl)
                     .modelName(OLLAMA_MODEL)
+                    .timeout(Duration.ofSeconds(timeoutSeconds))
                     .build();
         }
 
@@ -49,6 +55,7 @@ public class EmbeddingConfig {
                     .baseUrl(remoteBaseUrl)
                     .apiKey(remoteApiKey)
                     .modelName(remoteModelName)
+                    .timeout(Duration.ofSeconds(timeoutSeconds))
                     .build();
         }
 

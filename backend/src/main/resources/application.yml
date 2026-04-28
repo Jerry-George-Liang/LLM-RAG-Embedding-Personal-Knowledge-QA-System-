@@ -13,7 +13,8 @@ spring:
 langchain4j:
   open-ai:
     chat-model:
-      base-url: https://api.deepseek.com
+      # base-url: https://api.deepseek.com
+      base-url: https://tokenhub.tencentmaas.com/v1
       api-key: ${DEEPSEEK_API_KEY:}
       model-name: deepseek-v4-flash
       temperature: 0.7
@@ -22,17 +23,16 @@ langchain4j:
 # Embedding Model Configuration
 rag:
   embedding:
-    # 可选值: ollama(推荐) / remote(远程API) / local(ONNX本地模型)
     type: ollama
-    # Ollama 配置（本地部署，无需API Key）
+    timeout-seconds: 60
     ollama:
       base-url: http://localhost:11434
       # 常用 Ollama Embedding 模型:
-      #   nomic-embed-text     (轻量推荐，~274MB)
-      #   mxbai-embed-large   (质量更高，~670MB)
+      #   nomic-embed-text     (轻量推荐，~274MB, 768维)
+      #   mxbai-embed-large   (质量更高，~670MB, 1024维)
       #   all-minilm           (经典小模型)
-      # 使用前需先执行: ollama pull mxbai-embed-large
-      model-name: mxbai-embed-large
+      # 使用前需先执行: ollama pull nomic-embed-text
+      model-name: nomic-embed-text
     # 远程 API 配置（备用方案）
     # 本地 ONNX 配置（内置模型，首次下载较慢）
     local:
@@ -40,14 +40,30 @@ rag:
 
   # RAG Retrieval Parameters
   retrieval:
-    top-k: 5
-    min-score: 0.5
+    top-k: 8
+    min-score: 0.25
 
   # Document Splitting Parameters
   splitting:
-    max-segment-size: 1000
-    overlap: 200
-    chunk-overlap: 200
+    max-segment-size: 500
+    overlap: 50
+
+  # 向量化批处理参数
+  vectorization:
+    batch-size: 5
+
+  # PostgreSQL + pgvector 向量存储配置
+  vector:
+    pgvector:
+      host: localhost
+      port: 5432
+      database: rag
+      user: postgres
+      password: ${PGVECTOR_PASSWORD:liang}
+      table: document_embeddings
+      use-index: false
+      index-list-size: 100
+      drop-table-first: true  # 切换模型时需重建表（维度变化 1024->768）
 
 # Logging
 logging:

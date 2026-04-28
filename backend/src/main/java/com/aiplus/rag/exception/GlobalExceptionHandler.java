@@ -44,8 +44,15 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(HttpMessageNotWritableException.class)
     @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
     public ApiResponse<Void> handleHttpMessageNotWritableException(HttpMessageNotWritableException e) {
-        log.error("JSON序列化失败", e);
-        return ApiResponse.error(500, "响应序列化错误: " + getCauseMessage(e));
+        log.error("JSON序列化失败（可能是SSE响应类型不匹配）", e);
+        return ApiResponse.error(500, "SSE stream error: " + getCauseMessage(e));
+    }
+
+    @ExceptionHandler(RuntimeException.class)
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public ApiResponse<Void> handleRuntimeException(RuntimeException e) {
+        log.error("运行时异常", e);
+        return ApiResponse.error(500, getCauseMessage(e));
     }
 
     @ExceptionHandler(Exception.class)

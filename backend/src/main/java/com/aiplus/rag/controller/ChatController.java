@@ -99,8 +99,10 @@ public class ChatController {
             } catch (Exception e) {
                 log.error("流式问答处理异常", e);
                 try {
-                    String errorData = objectMapper.writeValueAsString(Map.of("type", "error", "error", e.getMessage()));
-                    emitter.send(SseEmitter.event().data(errorData));
+                    String errorData = objectMapper.writeValueAsString(
+                            Map.of("type", "error", "error", e.getMessage()));
+                    emitter.send(SseEmitter.event()
+                            .data(errorData, MediaType.APPLICATION_JSON));
                 } catch (IOException sendError) {
                     log.error("发送错误事件也失败", sendError);
                 }

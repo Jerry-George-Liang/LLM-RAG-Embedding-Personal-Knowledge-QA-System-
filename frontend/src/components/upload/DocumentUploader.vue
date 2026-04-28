@@ -40,12 +40,17 @@
         确认上传
       </el-button>
 
-      <el-progress
-        v-else
-        :percentage="uploadProgress"
-        :stroke-width="6"
-        style="flex: 1; max-width: 200px;"
-      />
+      <div v-else class="upload-progress-area">
+        <el-progress
+          :percentage="uploadProgress"
+          :stroke-width="6"
+          :status="uploadProgress >= 100 ? 'success' : undefined"
+          style="flex: 1; max-width: 200px;"
+        />
+        <span class="progress-label">
+          {{ uploadProgress >= 100 ? '处理中...' : `${uploadProgress}%` }}
+        </span>
+      </div>
 
       <el-button
         v-if="!uploading"
@@ -98,11 +103,25 @@ async function doUpload() {
   uploadProgress.value = 0
 
   try {
-    await documentStore.uploadFile(currentFile.value)
+    await documentStore.uploadFile(currentFile.value, (progress) => {
+      uploadProgress.value = progress
+    })
     ElMessage.success(`"${currentFile.value.name}" 上传成功，已加入知识库`)
     clearFile()
   } catch (error: any) {
-    ElMessage.error(error.message || '上传失败')
+    let errorMsg = '上传失败'
+    if (error?.response?.data?.message) {
+      errorMsg = error.response.data.message
+    } else if (error?.message) {
+      if (error.message.includes('timeout') || error.code === 'ECONNABORTED') {
+        errorMsg = '上传超时，请检查后端服务是否正常运行（Ollama/PGVector）'
+      } else if (error.message.includes('Network Error')) {
+        errorMsg = '网络错误，请检查后端服务是否已启动'
+      } else {
+        errorMsg = error.message
+      }
+    }
+    ElMessage.error(errorMsg)
   } finally {
     uploading.value = false
     uploadProgress.value = 0
@@ -174,6 +193,20 @@ function formatSize(bytes: number): string {
     .file-size {
       font-size: 12px;
       color: #999;
+    }
+
+    .upload-progress-area {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+      max-width: 260px;
+
+      .progress-label {
+        font-size: 12px;
+        color: #909399;
+        white-space: nowrap;
+      }
     }
   }
 }

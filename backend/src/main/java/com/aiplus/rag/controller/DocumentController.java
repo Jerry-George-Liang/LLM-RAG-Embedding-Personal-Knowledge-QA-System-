@@ -27,13 +27,34 @@ public class DocumentController {
             throw new IllegalArgumentException("上传文件不能为空");
         }
 
-        log.info("收到文件上传请求: {}，大小: {} bytes",
-                file.getOriginalFilename(), file.getSize());
+        String originalFilename = file.getOriginalFilename();
+        long fileSize = file.getSize();
+        log.info("收到文件上传请求: {}，大小: {} bytes ({}KB)",
+                originalFilename, fileSize, fileSize / 1024);
 
-        DocumentParseResult parseResult = documentParseService.parse(file);
-        DocumentMetadata metadata = vectorizationService.vectorize(parseResult);
+        long startTime = System.currentTimeMillis();
 
-        log.info("文档处理完成: {}，段落数: {}", metadata.getFileName(), metadata.getSegmentCount());
+        DocumentParseResult parseResult;
+        try {
+            parseResult = documentParseService.parse(file);
+            log.info("文件解析完成: {}，段落数: {}，耗时: {}ms",
+                    originalFilename, parseResult.getSegmentCount(),
+                    System.currentTimeMillis() - startTime);
+        } catch (Exception e) {
+            log.error("文件解析失败: {} - {}", originalFilename, e.getMessage(), e);
+            throw e;
+        }
+
+        DocumentMetadata metadata;
+        try {
+            metadata = vectorizationService.vectorize(parseResult);
+            log.info("文档处理完成: {}，段落数: {}，总耗时: {}ms",
+                    originalFilename, metadata.getSegmentCount(),
+                    System.currentTimeMillis() - startTime);
+        } catch (Exception e) {
+            log.error("向量化失败: {} - {}", originalFilename, e.getMessage(), e);
+            throw new RuntimeException("文档向量化处理失败: " + e.getMessage(), e);
+        }
 
         return ApiResponse.ok("文档上传成功", metadata);
     }

@@ -50,10 +50,17 @@
             <version>${langchain4j.version}</version>
         </dependency>
 
-        <!-- LangChain4j Core (for InMemoryEmbeddingStore, etc.) -->
+        <!-- LangChain4j Core -->
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j</artifactId>
+            <version>${langchain4j.version}</version>
+        </dependency>
+
+        <!-- LangChain4j PGVector (持久化向量存储) -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-pgvector</artifactId>
             <version>${langchain4j.version}</version>
         </dependency>
 
